@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import csv
+import io
 from datetime import datetime, timezone
 
 import aiosqlite
@@ -19,7 +21,6 @@ CREATE TABLE IF NOT EXISTS cancel_events (
 );
 """
 
-# Rules: which offer to show based on cancellation reason
 OFFER_RULES: dict[str, str] = {
     "too_expensive": "downgrade",
     "not_using": "pause",
@@ -73,6 +74,13 @@ async def create_cancel_event(db: aiosqlite.Connection, data: dict) -> tuple[dic
     return event, offer
 
 
+async def get_event(db: aiosqlite.Connection, event_id: int) -> dict | None:
+    rows = await db.execute_fetchall(
+        "SELECT * FROM cancel_events WHERE id = ?", (event_id,)
+    )
+    return _row(rows[0]) if rows else None
+
+
 async def update_outcome(db: aiosqlite.Connection, event_id: int, outcome: str, offer_accepted: str | None) -> dict | None:
     now = datetime.now(timezone.utc).isoformat()
     cur = await db.execute(
@@ -96,6 +104,25 @@ async def list_events(db: aiosqlite.Connection, outcome: str | None = None) -> l
             "SELECT * FROM cancel_events ORDER BY created_at DESC LIMIT 200"
         )
     return [_row(r) for r in rows]
+
+
+async def export_events_csv(db: aiosqlite.Connection, outcome: str | None = None) -> str:
+    if outcome:
+        rows = await db.execute_fetchall(
+            "SELECT * FROM cancel_events WHERE outcome=? ORDER BY created_at DESC", (outcome,)
+        )
+    else:
+        rows = await db.execute_fetchall(
+            "SELECT * FROM cancel_events ORDER BY created_at DESC"
+        )
+    buf = io.StringIO()
+    fields = ["id", "user_id", "plan", "reason", "mrr", "notes",
+              "offer_shown", "outcome", "created_at", "updated_at"]
+    writer = csv.DictWriter(buf, fieldnames=fields, extrasaction="ignore")
+    writer.writeheader()
+    for r in rows:
+        writer.writerow({k: r[k] for k in fields})
+    return buf.getvalue()
 
 
 async def get_stats(db: aiosqlite.Connection) -> dict:
