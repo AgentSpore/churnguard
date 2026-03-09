@@ -3,9 +3,13 @@ from __future__ import annotations
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, Query
+from fastapi.responses import StreamingResponse
 
 from models import CancelRequest, CancelResponse, OutcomeUpdate
-from engine import init_db, create_cancel_event, update_outcome, list_events, get_stats
+from engine import (
+    init_db, create_cancel_event, get_event,
+    update_outcome, list_events, export_events_csv, get_stats,
+)
 
 DB_PATH = "churnguard.db"
 
@@ -25,7 +29,7 @@ app = FastAPI(
         "(pause, downgrade, discount) based on cancellation reason. "
         "Track save rate and MRR recovered."
     ),
-    version="0.1.0",
+    version="0.2.0",
     lifespan=lifespan,
 )
 
@@ -55,12 +59,38 @@ async def record_outcome(event_id: int, body: OutcomeUpdate):
     return event
 
 
+@app.get("/events/export/csv")
+async def export_csv(
+    outcome: str | None = Query(None, description="Filter by outcome: pending, saved, cancelled"),
+):
+    """
+    Export cancel events as CSV. Useful for finance/ops analysis.
+    Optional ?outcome= filter to export only saved or churned users.
+    """
+    csv_data = await export_events_csv(app.state.db, outcome)
+    filename = f"churnguard_events{'_' + outcome if outcome else ''}.csv"
+    return StreamingResponse(
+        iter([csv_data]),
+        media_type="text/csv",
+        headers={"Content-Disposition": f"attachment; filename={filename}"},
+    )
+
+
 @app.get("/events", response_model=list[CancelResponse])
 async def list_cancel_events(
     outcome: str | None = Query(None, description="Filter: pending, saved, cancelled"),
 ):
     """List cancel events for your dashboard."""
     return await list_events(app.state.db, outcome)
+
+
+@app.get("/events/{event_id}", response_model=CancelResponse)
+async def cancel_event_detail(event_id: int):
+    """Get a single cancel event by ID."""
+    event = await get_event(app.state.db, event_id)
+    if not event:
+        raise HTTPException(404, "Cancel event not found")
+    return event
 
 
 @app.get("/stats")
