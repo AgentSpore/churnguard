@@ -9,6 +9,7 @@ from models import CancelRequest, CancelResponse, OutcomeUpdate
 from engine import (
     init_db, create_cancel_event, get_event,
     update_outcome, list_events, export_events_csv, get_stats,
+    get_stats_by_offer, get_stats_by_plan,
 )
 
 DB_PATH = "churnguard.db"
@@ -29,28 +30,19 @@ app = FastAPI(
         "(pause, downgrade, discount) based on cancellation reason. "
         "Track save rate and MRR recovered."
     ),
-    version="0.2.0",
+    version="0.3.0",
     lifespan=lifespan,
 )
 
 
 @app.post("/cancel")
 async def initiate_cancel(body: CancelRequest):
-    """
-    Call when a user initiates cancellation.
-    Returns the cancel event + a personalised save offer based on their reason.
-    Embed this in your cancel flow UI.
-    """
     event, offer = await create_cancel_event(app.state.db, body.model_dump())
     return {"event": event, "offer": offer}
 
 
 @app.post("/cancel/{event_id}/outcome", response_model=CancelResponse)
 async def record_outcome(event_id: int, body: OutcomeUpdate):
-    """
-    Record whether the user was saved or cancelled after seeing the offer.
-    Call this when the user makes their final decision.
-    """
     if body.outcome not in ("saved", "cancelled"):
         raise HTTPException(422, "outcome must be 'saved' or 'cancelled'")
     event = await update_outcome(app.state.db, event_id, body.outcome, body.offer_accepted)
@@ -63,10 +55,6 @@ async def record_outcome(event_id: int, body: OutcomeUpdate):
 async def export_csv(
     outcome: str | None = Query(None, description="Filter by outcome: pending, saved, cancelled"),
 ):
-    """
-    Export cancel events as CSV. Useful for finance/ops analysis.
-    Optional ?outcome= filter to export only saved or churned users.
-    """
     csv_data = await export_events_csv(app.state.db, outcome)
     filename = f"churnguard_events{'_' + outcome if outcome else ''}.csv"
     return StreamingResponse(
@@ -80,13 +68,11 @@ async def export_csv(
 async def list_cancel_events(
     outcome: str | None = Query(None, description="Filter: pending, saved, cancelled"),
 ):
-    """List cancel events for your dashboard."""
     return await list_events(app.state.db, outcome)
 
 
 @app.get("/events/{event_id}", response_model=CancelResponse)
 async def cancel_event_detail(event_id: int):
-    """Get a single cancel event by ID."""
     event = await get_event(app.state.db, event_id)
     if not event:
         raise HTTPException(404, "Cancel event not found")
@@ -95,8 +81,17 @@ async def cancel_event_detail(event_id: int):
 
 @app.get("/stats")
 async def churn_stats():
-    """
-    Aggregate stats: total cancel attempts, save rate (%),
-    MRR saved, top cancellation reasons.
-    """
+    """Overall: total attempts, save rate, MRR saved, top cancellation reasons."""
     return await get_stats(app.state.db)
+
+
+@app.get("/stats/by-offer")
+async def stats_by_offer():
+    """Per-offer effectiveness: save rate and MRR recovered for each offer type (pause, downgrade, discount)."""
+    return await get_stats_by_offer(app.state.db)
+
+
+@app.get("/stats/by-plan")
+async def stats_by_plan():
+    """Per-plan breakdown: cancel attempts, save rate, MRR at risk and recovered per subscription tier."""
+    return await get_stats_by_plan(app.state.db)
