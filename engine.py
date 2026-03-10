@@ -148,3 +148,59 @@ async def get_stats(db: aiosqlite.Connection) -> dict:
         "by_outcome": by_outcome,
         "top_reasons": top_reasons,
     }
+
+
+async def get_stats_by_offer(db: aiosqlite.Connection) -> list[dict]:
+    """Per-offer effectiveness: how many users saw each offer, save rate, MRR recovered."""
+    rows = await db.execute_fetchall("""
+        SELECT
+            COALESCE(offer_shown, 'none') AS offer_type,
+            COUNT(*) AS shown,
+            SUM(CASE WHEN outcome='saved' THEN 1 ELSE 0 END) AS saved,
+            ROUND(SUM(CASE WHEN outcome='saved' THEN COALESCE(mrr,0) ELSE 0 END), 2) AS mrr_saved
+        FROM cancel_events
+        WHERE outcome != 'pending'
+        GROUP BY offer_type
+        ORDER BY saved DESC
+    """)
+    result = []
+    for r in rows:
+        shown = r["shown"] or 0
+        saved = r["saved"] or 0
+        result.append({
+            "offer_type": r["offer_type"],
+            "shown": shown,
+            "saved": saved,
+            "declined": shown - saved,
+            "save_rate_pct": round(saved / shown * 100, 1) if shown else 0.0,
+            "mrr_saved": r["mrr_saved"] or 0.0,
+        })
+    return result
+
+
+async def get_stats_by_plan(db: aiosqlite.Connection) -> list[dict]:
+    """Per-plan breakdown: cancel attempts, save rate, MRR at risk and recovered."""
+    rows = await db.execute_fetchall("""
+        SELECT
+            plan,
+            COUNT(*) AS attempts,
+            SUM(CASE WHEN outcome='saved' THEN 1 ELSE 0 END) AS saved,
+            ROUND(SUM(COALESCE(mrr,0)), 2) AS mrr_at_risk,
+            ROUND(SUM(CASE WHEN outcome='saved' THEN COALESCE(mrr,0) ELSE 0 END), 2) AS mrr_saved
+        FROM cancel_events
+        GROUP BY plan
+        ORDER BY attempts DESC
+    """)
+    result = []
+    for r in rows:
+        attempts = r["attempts"] or 0
+        saved = r["saved"] or 0
+        result.append({
+            "plan": r["plan"],
+            "cancel_attempts": attempts,
+            "saved": saved,
+            "save_rate_pct": round(saved / attempts * 100, 1) if attempts else 0.0,
+            "mrr_at_risk": r["mrr_at_risk"] or 0.0,
+            "mrr_saved": r["mrr_saved"] or 0.0,
+        })
+    return result
