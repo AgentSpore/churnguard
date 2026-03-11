@@ -19,6 +19,33 @@ CREATE TABLE IF NOT EXISTS cancel_events (
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS winback_campaigns (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    reason_filter TEXT,
+    plan_filter TEXT,
+    offer_type TEXT NOT NULL,
+    offer_detail TEXT NOT NULL,
+    delay_days INTEGER NOT NULL DEFAULT 7,
+    status TEXT NOT NULL DEFAULT 'draft',
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS winback_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    campaign_id INTEGER NOT NULL,
+    cancel_event_id INTEGER NOT NULL,
+    user_id TEXT NOT NULL,
+    plan TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    mrr REAL,
+    status TEXT NOT NULL DEFAULT 'pending',
+    sent_at TEXT,
+    converted_at TEXT,
+    FOREIGN KEY (campaign_id) REFERENCES winback_campaigns(id),
+    FOREIGN KEY (cancel_event_id) REFERENCES cancel_events(id)
+);
 """
 
 OFFER_RULES: dict[str, str] = {
@@ -151,7 +178,6 @@ async def get_stats(db: aiosqlite.Connection) -> dict:
 
 
 async def get_stats_by_offer(db: aiosqlite.Connection) -> list[dict]:
-    """Per-offer effectiveness: how many users saw each offer, save rate, MRR recovered."""
     rows = await db.execute_fetchall("""
         SELECT
             COALESCE(offer_shown, 'none') AS offer_type,
@@ -179,7 +205,6 @@ async def get_stats_by_offer(db: aiosqlite.Connection) -> list[dict]:
 
 
 async def get_stats_by_plan(db: aiosqlite.Connection) -> list[dict]:
-    """Per-plan breakdown: cancel attempts, save rate, MRR at risk and recovered."""
     rows = await db.execute_fetchall("""
         SELECT
             plan,
@@ -204,3 +229,154 @@ async def get_stats_by_plan(db: aiosqlite.Connection) -> list[dict]:
             "mrr_saved": r["mrr_saved"] or 0.0,
         })
     return result
+
+
+async def create_winback(db: aiosqlite.Connection, data: dict) -> dict:
+    now = datetime.now(timezone.utc).isoformat()
+    cur = await db.execute(
+        """INSERT INTO winback_campaigns
+           (name, reason_filter, plan_filter, offer_type, offer_detail, delay_days, status, created_at)
+           VALUES (?,?,?,?,?,?,?,?)""",
+        (data["name"], data.get("reason_filter"), data.get("plan_filter"),
+         data["offer_type"], data["offer_detail"], data.get("delay_days", 7),
+         "draft", now),
+    )
+    await db.commit()
+    return await get_winback(db, cur.lastrowid)
+
+
+async def get_winback(db: aiosqlite.Connection, campaign_id: int) -> dict | None:
+    rows = await db.execute_fetchall(
+        "SELECT * FROM winback_campaigns WHERE id=?", (campaign_id,)
+    )
+    if not rows:
+        return None
+    c = _row(rows[0])
+
+    # Aggregate winback_events stats
+    stats = await db.execute_fetchall("""
+        SELECT
+            COUNT(*) AS total,
+            SUM(CASE WHEN status IN ('sent','converted','ignored') THEN 1 ELSE 0 END) AS sent,
+            SUM(CASE WHEN status='converted' THEN 1 ELSE 0 END) AS converted,
+            ROUND(SUM(CASE WHEN status='converted' THEN COALESCE(mrr,0) ELSE 0 END), 2) AS mrr_recovered
+        FROM winback_events WHERE campaign_id=?
+    """, (campaign_id,))
+    s = stats[0] if stats else None
+    total = s["total"] or 0 if s else 0
+    sent = s["sent"] or 0 if s else 0
+    converted = s["converted"] or 0 if s else 0
+    mrr_recovered = s["mrr_recovered"] or 0.0 if s else 0.0
+
+    return {
+        "id": c["id"],
+        "name": c["name"],
+        "reason_filter": c["reason_filter"],
+        "plan_filter": c["plan_filter"],
+        "offer_type": c["offer_type"],
+        "offer_detail": c["offer_detail"],
+        "delay_days": c["delay_days"],
+        "status": c["status"],
+        "eligible_count": total,
+        "sent_count": sent,
+        "converted_count": converted,
+        "conversion_rate_pct": round(converted / sent * 100, 1) if sent else 0.0,
+        "mrr_recovered": mrr_recovered,
+        "created_at": c["created_at"],
+    }
+
+
+async def list_winbacks(db: aiosqlite.Connection) -> list[dict]:
+    rows = await db.execute_fetchall(
+        "SELECT id FROM winback_campaigns ORDER BY id DESC"
+    )
+    result = []
+    for r in rows:
+        wb = await get_winback(db, r["id"])
+        if wb:
+            result.append(wb)
+    return result
+
+
+async def send_winback(db: aiosqlite.Connection, campaign_id: int) -> dict:
+    """Find eligible cancelled users and create winback_events for them."""
+    campaign = await db.execute_fetchall(
+        "SELECT * FROM winback_campaigns WHERE id=?", (campaign_id,)
+    )
+    if not campaign:
+        raise ValueError("Campaign not found")
+    c = _row(campaign[0])
+    if c["status"] == "sent":
+        raise ValueError("Campaign already sent")
+
+    # Build query for eligible cancelled users
+    conditions = ["outcome = 'cancelled'"]
+    params = []
+
+    if c["reason_filter"]:
+        conditions.append("reason = ?")
+        params.append(c["reason_filter"])
+    if c["plan_filter"]:
+        conditions.append("plan = ?")
+        params.append(c["plan_filter"])
+
+    # delay_days filter: only users cancelled at least N days ago
+    conditions.append(
+        "julianday('now') - julianday(updated_at) >= ?"
+    )
+    params.append(c["delay_days"])
+
+    where = " AND ".join(conditions)
+    rows = await db.execute_fetchall(
+        f"SELECT * FROM cancel_events WHERE {where} ORDER BY updated_at DESC",
+        tuple(params),
+    )
+
+    # Exclude users already targeted by this campaign
+    existing = await db.execute_fetchall(
+        "SELECT cancel_event_id FROM winback_events WHERE campaign_id=?", (campaign_id,)
+    )
+    existing_ids = {r["cancel_event_id"] for r in existing}
+
+    now = datetime.now(timezone.utc).isoformat()
+    new_count = 0
+    for r in rows:
+        if r["id"] in existing_ids:
+            continue
+        await db.execute(
+            """INSERT INTO winback_events
+               (campaign_id, cancel_event_id, user_id, plan, reason, mrr, status, sent_at)
+               VALUES (?,?,?,?,?,?,?,?)""",
+            (campaign_id, r["id"], r["user_id"], r["plan"], r["reason"], r["mrr"], "sent", now),
+        )
+        new_count += 1
+
+    await db.execute(
+        "UPDATE winback_campaigns SET status='sent' WHERE id=?", (campaign_id,)
+    )
+    await db.commit()
+
+    return await get_winback(db, campaign_id)
+
+
+async def convert_winback_event(db: aiosqlite.Connection, campaign_id: int, event_id: int) -> dict | None:
+    """Mark a winback event as converted (user came back)."""
+    now = datetime.now(timezone.utc).isoformat()
+    cur = await db.execute(
+        "UPDATE winback_events SET status='converted', converted_at=? WHERE id=? AND campaign_id=?",
+        (now, event_id, campaign_id),
+    )
+    await db.commit()
+    if cur.rowcount == 0:
+        return None
+    rows = await db.execute_fetchall(
+        "SELECT * FROM winback_events WHERE id=?", (event_id,)
+    )
+    return _row(rows[0]) if rows else None
+
+
+async def list_winback_events(db: aiosqlite.Connection, campaign_id: int) -> list[dict]:
+    rows = await db.execute_fetchall(
+        "SELECT * FROM winback_events WHERE campaign_id=? ORDER BY id DESC", (campaign_id,)
+    )
+    return [_row(r) for r in rows]

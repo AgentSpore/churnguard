@@ -5,11 +5,16 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import StreamingResponse
 
-from models import CancelRequest, CancelResponse, OutcomeUpdate
+from models import (
+    CancelRequest, CancelResponse, OutcomeUpdate,
+    WinbackCreate, WinbackResponse, WinbackEventResponse,
+)
 from engine import (
     init_db, create_cancel_event, get_event,
     update_outcome, list_events, export_events_csv, get_stats,
     get_stats_by_offer, get_stats_by_plan,
+    create_winback, list_winbacks, get_winback, send_winback,
+    convert_winback_event, list_winback_events,
 )
 
 DB_PATH = "churnguard.db"
@@ -28,9 +33,10 @@ app = FastAPI(
         "Cancel flow automation for SaaS. "
         "Intercept churn before it happens — trigger personalised save offers "
         "(pause, downgrade, discount) based on cancellation reason. "
-        "Track save rate and MRR recovered."
+        "Win back churned users with targeted re-engagement campaigns. "
+        "Track save rate, win-back conversion, and MRR recovered."
     ),
-    version="0.3.0",
+    version="0.4.0",
     lifespan=lifespan,
 )
 
@@ -87,11 +93,59 @@ async def churn_stats():
 
 @app.get("/stats/by-offer")
 async def stats_by_offer():
-    """Per-offer effectiveness: save rate and MRR recovered for each offer type (pause, downgrade, discount)."""
+    """Per-offer effectiveness: save rate and MRR recovered for each offer type."""
     return await get_stats_by_offer(app.state.db)
 
 
 @app.get("/stats/by-plan")
 async def stats_by_plan():
-    """Per-plan breakdown: cancel attempts, save rate, MRR at risk and recovered per subscription tier."""
+    """Per-plan breakdown: cancel attempts, save rate, MRR at risk and recovered."""
     return await get_stats_by_plan(app.state.db)
+
+
+@app.post("/winback", response_model=WinbackResponse, status_code=201)
+async def create_winback_campaign(body: WinbackCreate):
+    """Create a win-back campaign targeting churned users by reason/plan with a custom offer."""
+    return await create_winback(app.state.db, body.model_dump())
+
+
+@app.get("/winback", response_model=list[WinbackResponse])
+async def list_winback_campaigns():
+    """List all win-back campaigns with conversion stats."""
+    return await list_winbacks(app.state.db)
+
+
+@app.get("/winback/{campaign_id}", response_model=WinbackResponse)
+async def winback_detail(campaign_id: int):
+    """Win-back campaign detail with eligible count, sent, converted, MRR recovered."""
+    wb = await get_winback(app.state.db, campaign_id)
+    if not wb:
+        raise HTTPException(404, "Win-back campaign not found")
+    return wb
+
+
+@app.get("/winback/{campaign_id}/events", response_model=list[WinbackEventResponse])
+async def winback_events(campaign_id: int):
+    """List all winback events (users targeted) for a campaign."""
+    wb = await get_winback(app.state.db, campaign_id)
+    if not wb:
+        raise HTTPException(404, "Win-back campaign not found")
+    return await list_winback_events(app.state.db, campaign_id)
+
+
+@app.post("/winback/{campaign_id}/send", response_model=WinbackResponse)
+async def send_winback_campaign(campaign_id: int):
+    """Send win-back offers to eligible churned users (cancelled + delay_days elapsed)."""
+    try:
+        return await send_winback(app.state.db, campaign_id)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+
+@app.post("/winback/{campaign_id}/convert/{event_id}", response_model=WinbackEventResponse)
+async def mark_converted(campaign_id: int, event_id: int):
+    """Mark a churned user as converted (won back). Updates conversion stats."""
+    result = await convert_winback_event(app.state.db, campaign_id, event_id)
+    if not result:
+        raise HTTPException(404, "Winback event not found")
+    return result
